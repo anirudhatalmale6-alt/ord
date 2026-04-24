@@ -90,13 +90,13 @@ function renderLanding() {
         <div>
           <div class="hero-badge">&#9889; AI-Powered Writing Assistant</div>
           <h1>Write perfectly in <span class="gradient-text">every language</span></h1>
-          <p class="hero-desc">Ord uses advanced AI to check grammar, spelling, and style in 19+ languages. From Swedish to Urdu, Hindi to Japanese &mdash; write with confidence everywhere.</p>
+          <p class="hero-desc">Ord uses advanced AI to check grammar, spelling, and style in 23+ languages. From Swedish to Urdu, Hindi to Japanese &mdash; write with confidence everywhere.</p>
           <div class="hero-actions">
             <button class="btn btn-primary btn-lg" onclick="showAuthModal('register')">Start Free &rarr;</button>
             <button class="btn btn-secondary btn-lg" onclick="scrollToSection(event,'features-section')">See Features</button>
           </div>
           <div class="hero-stats">
-            <div class="hero-stat"><div class="hero-stat-value">19+</div><div class="hero-stat-label">Languages</div></div>
+            <div class="hero-stat"><div class="hero-stat-value">23+</div><div class="hero-stat-label">Languages</div></div>
             <div class="hero-stat"><div class="hero-stat-value">AI</div><div class="hero-stat-label">Powered by Claude</div></div>
             <div class="hero-stat"><div class="hero-stat-value">$5</div><div class="hero-stat-label">/month Pro</div></div>
           </div>
@@ -169,7 +169,7 @@ function renderLanding() {
           </div>
           <div class="feature-card">
             <div class="feature-icon" style="background:#ecfdf5;color:#059669">&#127760;</div>
-            <h3>19+ Languages</h3>
+            <h3>23+ Languages</h3>
             <p>From Swedish to Urdu, Hindi to Japanese. The most comprehensive multilingual AI writing assistant available.</p>
           </div>
         </div>
@@ -182,7 +182,7 @@ function renderLanding() {
         <div class="section-header">
           <div class="section-badge" style="background:rgba(59,130,246,0.15);color:#93c5fd">&#127760; Languages</div>
           <h2 style="color:#fff">Write in any language</h2>
-          <p style="color:#94a3b8">Ord supports 19+ languages with deep understanding of grammar rules, idioms, and cultural nuances.</p>
+          <p style="color:#94a3b8">Ord supports 23+ languages with deep understanding of grammar rules, idioms, and cultural nuances.</p>
         </div>
         <div class="lang-grid">
           ${[
@@ -207,7 +207,8 @@ function renderLanding() {
             ['&#127471;&#127477;','Japanese','East Asian'],
             ['&#127472;&#127479;','Korean','East Asian'],
             ['&#127479;&#127482;','Russian','European'],
-            ['&#127481;&#127479;','Turkish','European']
+            ['&#127481;&#127479;','Turkish','European'],
+            ['&#127477;&#127472;','Pahari','South Asian']
           ].map(([flag, name, region]) => `
             <div class="lang-card">
               <span class="lang-flag">${flag}</span>
@@ -305,7 +306,7 @@ function renderLanding() {
             <div class="price-period">Forever free</div>
             <ul class="price-features">
               <li>20 checks per day</li>
-              <li>All 19+ languages</li>
+              <li>All 23+ languages</li>
               <li>Grammar & spelling</li>
               <li>Chrome extension</li>
               <li>Basic style suggestions</li>
@@ -319,7 +320,7 @@ function renderLanding() {
             <div class="price-period">Cancel anytime</div>
             <ul class="price-features">
               <li>Unlimited checks</li>
-              <li>All 19+ languages</li>
+              <li>All 23+ languages</li>
               <li>Grammar, spelling & style</li>
               <li>Rephrase & tone adjustment</li>
               <li>Priority AI processing</li>
@@ -367,6 +368,7 @@ function renderLanding() {
               <li><a href="#">English</a></li>
               <li><a href="#">Urdu</a></li>
               <li><a href="#">Hindi</a></li>
+              <li><a href="#">Pahari</a></li>
               <li><a href="#">All Languages</a></li>
             </ul>
           </div>
@@ -386,6 +388,30 @@ function renderLanding() {
       </div>
     </footer>
 
+    <!-- Chatbot -->
+    <div id="ord-chatbot">
+      <div class="chatbot-window hidden" id="chatbotWindow">
+        <div class="chatbot-header">
+          <div class="chatbot-header-left">
+            <div class="chatbot-avatar">O</div>
+            <div>
+              <h4>Ord Assistant</h4>
+              <p>Ask me anything about Ord</p>
+            </div>
+          </div>
+          <button class="chatbot-close" onclick="toggleChatbot()">&times;</button>
+        </div>
+        <div class="chatbot-messages" id="chatbotMessages">
+          <div class="chatbot-msg bot">Hi! I'm the Ord assistant. I can help you with questions about our AI writing tool, supported languages, pricing, or how to get started. What would you like to know?</div>
+        </div>
+        <div class="chatbot-input-area">
+          <input type="text" id="chatbotInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendChatMsg()">
+          <button onclick="sendChatMsg()">Send</button>
+        </div>
+      </div>
+      <button class="chatbot-fab" onclick="toggleChatbot()" title="Chat with us">&#128172;</button>
+    </div>
+
     <!-- Auth Modal -->
     <div class="modal-overlay hidden" id="authModal">
       <div class="modal">
@@ -398,6 +424,47 @@ function renderLanding() {
     </div>
   `;
 }
+
+function toggleChatbot() {
+  const w = document.getElementById('chatbotWindow');
+  if (w) w.classList.toggle('hidden');
+}
+
+async function sendChatMsg() {
+  const input = document.getElementById('chatbotInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+
+  const messages = document.getElementById('chatbotMessages');
+  messages.innerHTML += '<div class="chatbot-msg user">' + escHtml(msg) + '</div>';
+  messages.innerHTML += '<div class="chatbot-msg typing" id="chatTyping">Thinking...</div>';
+  messages.scrollTop = messages.scrollHeight;
+
+  try {
+    const resp = await fetch(API + '/chatbot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: msg })
+    });
+    const data = await resp.json();
+    const typing = document.getElementById('chatTyping');
+    if (typing) typing.remove();
+
+    if (data.reply) {
+      messages.innerHTML += '<div class="chatbot-msg bot">' + escHtml(data.reply) + '</div>';
+    } else {
+      messages.innerHTML += '<div class="chatbot-msg bot">Sorry, I could not process that. Try again!</div>';
+    }
+  } catch {
+    const typing = document.getElementById('chatTyping');
+    if (typing) typing.remove();
+    messages.innerHTML += '<div class="chatbot-msg bot">Something went wrong. Please try again.</div>';
+  }
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 function scrollToSection(e, id) {
   e.preventDefault();
@@ -844,7 +911,7 @@ function renderTutorialsPage() {
         <h2 style="font-size:24px;font-weight:700;margin-bottom:16px">4. Multi-Language Support</h2>
         <div class="card">
           <div class="card-body" style="line-height:1.8;font-size:15px;color:#334155">
-            <p style="margin-bottom:16px">Ord supports 19+ languages. To switch language:</p>
+            <p style="margin-bottom:16px">Ord supports 23+ languages. To switch language:</p>
             <ol style="padding-left:24px;margin-bottom:16px">
               <li>Click the Ord extension icon in your toolbar</li>
               <li>Select your language from the grid</li>

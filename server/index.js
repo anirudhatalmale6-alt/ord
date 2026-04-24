@@ -16,6 +16,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'ord_default_secret';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
+const AI_API_KEY = process.env.AI_API_KEY || '';
 
 const app = express();
 const router = express.Router();
@@ -237,6 +238,53 @@ router.post('/api/track', auth, (req, res) => {
   db.prepare('INSERT INTO api_usage (user_id, endpoint, language, chars_checked) VALUES (?, ?, ?, ?)').run(req.user.id, endpoint || 'check', language || 'sv', chars_checked || 0);
   db.prepare('UPDATE users SET api_calls_today = api_calls_today + 1 WHERE id = ?').run(req.user.id);
   res.json({ ok: true });
+});
+
+// ─── Chatbot ───
+router.post('/api/chatbot', async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+  if (!AI_API_KEY) return res.json({ reply: 'Chatbot is not configured yet. Please contact support.' });
+
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': AI_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 512,
+        system: `You are the Ord AI assistant on the Ord website (skylarkmedia.se/ord). Ord is an AI-powered grammar and spell checker that works as a Chrome browser extension.
+
+Key facts about Ord:
+- Supports 23+ languages including Swedish, English, Norwegian, Danish, Finnish, German, French, Spanish, Italian, Portuguese, Dutch, Polish, Urdu, Hindi, Punjabi, Dari, Pahari, Arabic, Chinese, Japanese, Korean, Russian, Turkish
+- Free plan: 20 grammar checks per day, all languages
+- Pro plan: $5/month, unlimited checks, rephrase/tone tools, priority processing
+- Works on any website in any text field (Gmail, Google Docs, social media, forms)
+- AI-powered (not rule-based like traditional grammar checkers)
+- Features: grammar check, spell check, style/tone suggestions, rephrase (formal/casual/concise)
+- Keyboard shortcut: Ctrl+Shift+G
+- Right-click context menu integration
+- Privacy first: text is processed and never stored
+- Special support for Pahari language with custom font
+
+Be helpful, concise, and friendly. Answer in the same language the user writes in. Keep responses under 3 sentences when possible.`,
+        messages: [{ role: 'user', content: message }]
+      })
+    });
+
+    const data = await resp.json();
+    if (data.content && data.content[0]) {
+      return res.json({ reply: data.content[0].text });
+    }
+    res.json({ reply: 'Sorry, I could not process that right now. Please try again.' });
+  } catch (err) {
+    console.error('[chatbot]', err.message);
+    res.json({ reply: 'Something went wrong. Please try again later.' });
+  }
 });
 
 // Fallback SPA
