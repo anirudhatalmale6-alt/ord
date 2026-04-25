@@ -420,6 +420,96 @@ router.get('/api/admin/stats', auth, adminOnly, (req, res) => {
   res.json({ totalUsers, proUsers, totalChecks, todayChecks });
 });
 
+// ─── Web Editor API (JWT auth, for dashboard writer) ───
+router.post('/api/editor/check', auth, async (req, res) => {
+  const { text, language } = req.body;
+  if (!text || text.trim().length < 2) return res.status(400).json({ error: 'Text required' });
+  if (text.length > 10000) return res.status(400).json({ error: 'Text too long. Maximum 10,000 characters.' });
+  if (!AI_API_KEY) return res.status(500).json({ error: 'AI service not configured' });
+
+  const limit = checkRateLimit(req.user.id);
+  if (!limit.allowed) return res.status(429).json({ error: limit.reason });
+
+  const langName = LANG_NAMES[language] || language || 'English';
+  const systemPrompt = `You are a professional ${langName} grammar and spelling checker. Analyze the text and return a JSON response with this exact structure:
+{
+  "corrected": "the full corrected text",
+  "issues": [
+    {
+      "type": "grammar|spelling|punctuation|style",
+      "original": "the wrong part",
+      "suggestion": "the corrected part",
+      "explanation": "brief explanation in ${langName}"
+    }
+  ],
+  "score": 85
+}
+
+Rules:
+- "corrected" must contain the full text with all corrections applied
+- "issues" lists each problem found (empty array if text is perfect)
+- "score" is a writing quality score from 0-100
+- Keep explanations short and in ${langName}
+- Respond ONLY with valid JSON, no markdown, no backticks`;
+
+  try {
+    const raw = await callClaude(systemPrompt, text);
+    const parsed = parseJSON(raw);
+    if (!parsed) return res.status(500).json({ error: 'Failed to parse AI response' });
+
+    db.prepare('INSERT INTO api_usage (user_id, endpoint, language, chars_checked) VALUES (?, ?, ?, ?)').run(req.user.id, 'check', language || 'en', text.length);
+    db.prepare('UPDATE users SET api_calls_today = api_calls_today + 1 WHERE id = ?').run(req.user.id);
+
+    res.json({ result: parsed });
+  } catch (e) {
+    console.error('[editor/check]', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/api/editor/rephrase', auth, async (req, res) => {
+  const { text, language, style } = req.body;
+  if (!text || text.trim().length < 2) return res.status(400).json({ error: 'Text required' });
+  if (text.length > 10000) return res.status(400).json({ error: 'Text too long. Maximum 10,000 characters.' });
+  if (!AI_API_KEY) return res.status(500).json({ error: 'AI service not configured' });
+
+  const limit = checkRateLimit(req.user.id);
+  if (!limit.allowed) return res.status(429).json({ error: limit.reason });
+
+  const langName = LANG_NAMES[language] || language || 'English';
+  const styleInstructions = {
+    rephrase: `Rephrase the text in ${langName} to be clearer and more natural while keeping the same meaning.`,
+    formal: `Rewrite the text in ${langName} using formal, professional language suitable for business correspondence.`,
+    casual: `Rewrite the text in ${langName} using casual, friendly language suitable for informal communication.`,
+    concise: `Make the text shorter and more concise in ${langName} while keeping the key meaning.`,
+    elaborate: `Expand and elaborate on the text in ${langName} with more detail and nuance.`
+  };
+
+  const systemPrompt = `You are a professional ${langName} writing assistant. ${styleInstructions[style] || styleInstructions.rephrase}
+
+Return a JSON response:
+{
+  "rephrased": "the rephrased text",
+  "changes": "brief description of what changed, in ${langName}"
+}
+
+Respond ONLY with valid JSON, no markdown, no backticks.`;
+
+  try {
+    const raw = await callClaude(systemPrompt, text);
+    const parsed = parseJSON(raw);
+    if (!parsed) return res.status(500).json({ error: 'Failed to parse AI response' });
+
+    db.prepare('INSERT INTO api_usage (user_id, endpoint, language, chars_checked) VALUES (?, ?, ?, ?)').run(req.user.id, 'rephrase', language || 'en', text.length);
+    db.prepare('UPDATE users SET api_calls_today = api_calls_today + 1 WHERE id = ?').run(req.user.id);
+
+    res.json({ result: parsed });
+  } catch (e) {
+    console.error('[editor/rephrase]', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ─── Extension API (grammar check / rephrase) ───
 function apiKeyAuth(req, res, next) {
   const apiKey = req.headers['x-api-key'];
