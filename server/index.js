@@ -3,6 +3,8 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const express = require('express');
 const helmet = require('helmet');
 const compression = require('compression');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { v4: uuid } = require('uuid');
@@ -12,7 +14,8 @@ const db = require('./db');
 
 const PORT = parseInt(process.env.PORT, 10) || 3025;
 const BASE_PATH = process.env.BASE_PATH || '/ord';
-const JWT_SECRET = process.env.JWT_SECRET || 'ord_default_secret';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error('JWT_SECRET required');
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
@@ -21,8 +24,54 @@ const AI_API_KEY = process.env.AI_API_KEY || '';
 const app = express();
 const router = express.Router();
 
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'", "fonts.googleapis.com"],
+      fontSrc: ["fonts.gstatic.com"],
+      connectSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"]
+    }
+  },
+  crossOriginEmbedderPolicy: false
+}));
 app.use(compression());
+app.use(cors({ origin: ['https://skylarkmedia.se'], credentials: true }));
+
+// Rate limiters
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  message: { error: 'Too many registration attempts. Please try again in an hour.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const chatbotLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: 'Too many requests. Please wait a moment before trying again.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const newsletterLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many subscription attempts. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 // Stripe webhook needs raw body
 app.use(BASE_PATH + '/api/stripe/webhook', express.raw({ type: 'application/json' }));
@@ -41,6 +90,12 @@ function auth(req, res, next) {
   } catch {
     res.status(401).json({ error: 'Invalid token' });
   }
+}
+
+function adminOnly(req, res, next) {
+  const user = db.prepare('SELECT role FROM users WHERE id = ?').get(req.user.id);
+  if (!user || user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  next();
 }
 
 // Free tier: 20 checks/day. Pro: unlimited.
@@ -65,9 +120,14 @@ function checkRateLimit(userId) {
 }
 
 // ─── Auth Routes ───
-router.post('/api/auth/register', (req, res) => {
+router.post('/api/auth/register', registerLimiter, (req, res) => {
   const { email, password, name } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
   const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
   if (existing) return res.status(400).json({ error: 'Email already registered' });
@@ -78,22 +138,24 @@ router.post('/api/auth/register', (req, res) => {
   db.prepare('INSERT INTO users (id, email, password, name, api_key) VALUES (?, ?, ?, ?, ?)').run(id, email, hash, name || '', apiKey);
 
   const token = jwt.sign({ id, email, plan: 'free' }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: { id, email, name: name || '', plan: 'free', api_key: apiKey } });
+  const maskedKey = '****' + apiKey.slice(-4);
+  res.json({ token, user: { id, email, name: name || '', plan: 'free', api_key: maskedKey } });
 });
 
-router.post('/api/auth/login', (req, res) => {
+router.post('/api/auth/login', loginLimiter, (req, res) => {
   const { email, password } = req.body;
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   if (!user || !bcrypt.compareSync(password, user.password)) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
-  const token = jwt.sign({ id: user.id, email: user.email, plan: user.plan }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan, api_key: user.api_key } });
+  const token = jwt.sign({ id: user.id, email: user.email, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '30d' });
+  const maskedKey = user.api_key ? '****' + user.api_key.slice(-4) : null;
+  res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, plan: user.plan, api_key: maskedKey } });
 });
 
 router.get('/api/auth/me', auth, (req, res) => {
-  const user = db.prepare('SELECT id, email, name, plan, api_key, api_calls_today, created_at FROM users WHERE id = ?').get(req.user.id);
+  const user = db.prepare('SELECT id, email, name, role, plan, api_key, api_calls_today, created_at FROM users WHERE id = ?').get(req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   const today = new Date().toISOString().split('T')[0];
   const calls = db.prepare('SELECT api_calls_today, api_calls_reset FROM users WHERE id = ?').get(req.user.id);
@@ -132,10 +194,78 @@ router.get('/api/usage', auth, (req, res) => {
   res.json({ stats, totals, langStats });
 });
 
+router.get('/api/writing-stats', auth, (req, res) => {
+  const userId = req.user.id;
+
+  const totals = db.prepare(`
+    SELECT COUNT(*) as total_checks, COALESCE(SUM(chars_checked), 0) as total_chars,
+    COUNT(DISTINCT date(created_at)) as active_days
+    FROM api_usage WHERE user_id = ?
+  `).get(userId);
+
+  const byEndpoint = db.prepare(`
+    SELECT endpoint, COUNT(*) as count FROM api_usage WHERE user_id = ? GROUP BY endpoint
+  `).all(userId);
+
+  const byLanguage = db.prepare(`
+    SELECT language, COUNT(*) as count FROM api_usage WHERE user_id = ? GROUP BY language ORDER BY count DESC
+  `).all(userId);
+
+  const last7days = db.prepare(`
+    SELECT date(created_at) as day, COUNT(*) as checks, COALESCE(SUM(chars_checked), 0) as chars
+    FROM api_usage WHERE user_id = ? AND created_at >= datetime('now', '-7 days')
+    GROUP BY day ORDER BY day
+  `).all(userId);
+
+  const last30days = db.prepare(`
+    SELECT date(created_at) as day, COUNT(*) as checks
+    FROM api_usage WHERE user_id = ? AND created_at >= datetime('now', '-30 days')
+    GROUP BY day ORDER BY day
+  `).all(userId);
+
+  const today = db.prepare(`
+    SELECT COUNT(*) as checks, COALESCE(SUM(chars_checked), 0) as chars
+    FROM api_usage WHERE user_id = ? AND date(created_at) = date('now')
+  `).get(userId);
+
+  const streak = calculateStreak(userId);
+
+  res.json({ totals, byEndpoint, byLanguage, last7days, last30days, today, streak });
+});
+
+function calculateStreak(userId) {
+  const days = db.prepare(`
+    SELECT DISTINCT date(created_at) as day FROM api_usage WHERE user_id = ? ORDER BY day DESC LIMIT 60
+  `).all(userId).map(r => r.day);
+
+  if (!days.length) return 0;
+
+  let streak = 0;
+  const today = new Date().toISOString().split('T')[0];
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+
+  if (days[0] !== today && days[0] !== yesterday) return 0;
+
+  let expected = new Date(days[0]);
+  for (const day of days) {
+    const d = new Date(day);
+    if (d.toISOString().split('T')[0] === expected.toISOString().split('T')[0]) {
+      streak++;
+      expected = new Date(expected.getTime() - 86400000);
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
 router.put('/api/profile', auth, (req, res) => {
   const { name, password } = req.body;
   if (name !== undefined) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.user.id);
-  if (password) db.prepare('UPDATE users SET password = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.user.id);
+  if (password) {
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    db.prepare('UPDATE users SET password = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.user.id);
+  }
   const user = db.prepare('SELECT id, email, name, plan, api_key FROM users WHERE id = ?').get(req.user.id);
   res.json({ user });
 });
@@ -174,7 +304,8 @@ router.post('/api/create-checkout', auth, (req, res) => {
 
       res.json({ url: session.url });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      console.error('[create-checkout]', e.message);
+      res.status(500).json({ error: 'Internal server error' });
     }
   })();
 });
@@ -215,15 +346,20 @@ router.post('/api/cancel-subscription', auth, (req, res) => {
       db.prepare('UPDATE users SET plan = ?, stripe_subscription_id = NULL WHERE id = ?').run('free', req.user.id);
       res.json({ message: 'Subscription cancelled' });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      console.error('[cancel-subscription]', e.message);
+      res.status(500).json({ error: 'Internal server error' });
     }
   })();
 });
 
 // ─── Newsletter ───
-router.post('/api/newsletter', (req, res) => {
+router.post('/api/newsletter', newsletterLimiter, (req, res) => {
   const { email, name } = req.body;
   if (!email) return res.status(400).json({ error: 'Email required' });
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+
   try {
     db.prepare('INSERT OR IGNORE INTO newsletter (email, name) VALUES (?, ?)').run(email, name || '');
     res.json({ message: 'Subscribed!' });
@@ -240,8 +376,221 @@ router.post('/api/track', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Admin ───
+router.get('/api/admin/users', auth, adminOnly, (req, res) => {
+  const users = db.prepare('SELECT id, email, name, role, plan, api_calls_today, created_at FROM users ORDER BY created_at DESC').all();
+  res.json({ users });
+});
+
+router.post('/api/admin/users', auth, adminOnly, (req, res) => {
+  const { email, password, name, role, plan } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (existing) return res.status(400).json({ error: 'Email already exists' });
+  const id = uuid();
+  const hash = bcrypt.hashSync(password, 10);
+  const apiKey = 'ord_' + crypto.randomBytes(24).toString('hex');
+  db.prepare('INSERT INTO users (id, email, password, name, role, plan, api_key) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, email, hash, name || '', role || 'user', plan || 'free', apiKey);
+  res.json({ user: { id, email, name: name || '', role: role || 'user', plan: plan || 'free' } });
+});
+
+router.put('/api/admin/users/:id', auth, adminOnly, (req, res) => {
+  const { name, email, role, plan, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (name !== undefined) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.params.id);
+  if (email) db.prepare('UPDATE users SET email = ? WHERE id = ?').run(email, req.params.id);
+  if (role) db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, req.params.id);
+  if (plan) db.prepare('UPDATE users SET plan = ? WHERE id = ?').run(plan, req.params.id);
+  if (password) db.prepare('UPDATE users SET password = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.params.id);
+  res.json({ message: 'User updated' });
+});
+
+router.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
+  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
+  db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+  res.json({ message: 'User deleted' });
+});
+
+router.get('/api/admin/stats', auth, adminOnly, (req, res) => {
+  const totalUsers = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+  const proUsers = db.prepare("SELECT COUNT(*) as c FROM users WHERE plan = 'pro'").get().c;
+  const totalChecks = db.prepare('SELECT COUNT(*) as c FROM api_usage').get().c;
+  const todayChecks = db.prepare("SELECT COUNT(*) as c FROM api_usage WHERE date(created_at) = date('now')").get().c;
+  res.json({ totalUsers, proUsers, totalChecks, todayChecks });
+});
+
+// ─── Extension API (grammar check / rephrase) ───
+function apiKeyAuth(req, res, next) {
+  const apiKey = req.headers['x-api-key'];
+  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+  const user = db.prepare('SELECT id, plan, api_calls_today, api_calls_reset FROM users WHERE api_key = ?').get(apiKey);
+  if (!user) return res.status(401).json({ error: 'Invalid API key' });
+  const limit = checkRateLimit(user.id);
+  if (!limit.allowed) return res.status(429).json({ error: limit.reason });
+  req.apiUser = user;
+  next();
+}
+
+const LANG_NAMES = {
+  sv: 'Swedish', en: 'English', no: 'Norwegian', da: 'Danish', fi: 'Finnish',
+  de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese',
+  nl: 'Dutch', pl: 'Polish', ar: 'Arabic', zh: 'Chinese', ja: 'Japanese',
+  ko: 'Korean', ru: 'Russian', tr: 'Turkish', hi: 'Hindi', ur: 'Urdu',
+  pa: 'Punjabi', phr: 'Pahari', prs: 'Dari'
+};
+
+async function callClaude(systemPrompt, userContent) {
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': AI_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2048,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userContent }]
+    })
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error?.message || `API error: ${resp.status}`);
+  }
+  const data = await resp.json();
+  return data.content[0].text;
+}
+
+function parseJSON(raw) {
+  try { return JSON.parse(raw); } catch {}
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (m) try { return JSON.parse(m[0]); } catch {}
+  return null;
+}
+
+router.post('/api/check', apiKeyAuth, async (req, res) => {
+  const { text, language } = req.body;
+  if (!text || text.trim().length < 2) return res.status(400).json({ error: 'Text required' });
+  if (text.length > 10000) return res.status(400).json({ error: 'Text too long. Maximum 10,000 characters.' });
+  if (!AI_API_KEY) return res.status(500).json({ error: 'AI service not configured' });
+
+  const langName = LANG_NAMES[language] || language || 'English';
+  const systemPrompt = `You are a professional ${langName} grammar and spelling checker. Analyze the text and return a JSON response with this exact structure:
+{
+  "corrected": "the full corrected text",
+  "issues": [
+    {
+      "type": "grammar|spelling|punctuation|style",
+      "original": "the wrong part",
+      "suggestion": "the corrected part",
+      "explanation": "brief explanation in ${langName}"
+    }
+  ],
+  "score": 85
+}
+
+Rules:
+- "corrected" must contain the full text with all corrections applied
+- "issues" lists each problem found (empty array if text is perfect)
+- "score" is a writing quality score from 0-100
+- Keep explanations short and in ${langName}
+- Respond ONLY with valid JSON, no markdown, no backticks`;
+
+  try {
+    const raw = await callClaude(systemPrompt, text);
+    const parsed = parseJSON(raw);
+    if (!parsed) return res.status(500).json({ error: 'Failed to parse AI response' });
+
+    db.prepare('INSERT INTO api_usage (user_id, endpoint, language, chars_checked) VALUES (?, ?, ?, ?)').run(req.apiUser.id, 'check', language || 'en', text.length);
+    db.prepare('UPDATE users SET api_calls_today = api_calls_today + 1 WHERE id = ?').run(req.apiUser.id);
+
+    res.json({ result: parsed });
+  } catch (e) {
+    console.error('[check]', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/api/rephrase', apiKeyAuth, async (req, res) => {
+  const { text, language, style } = req.body;
+  if (!text || text.trim().length < 2) return res.status(400).json({ error: 'Text required' });
+  if (text.length > 10000) return res.status(400).json({ error: 'Text too long. Maximum 10,000 characters.' });
+  if (!AI_API_KEY) return res.status(500).json({ error: 'AI service not configured' });
+
+  const langName = LANG_NAMES[language] || language || 'English';
+  const styleInstructions = {
+    rephrase: `Rephrase the text in ${langName} to be clearer and more natural while keeping the same meaning.`,
+    formal: `Rewrite the text in ${langName} using formal, professional language suitable for business correspondence.`,
+    casual: `Rewrite the text in ${langName} using casual, friendly language suitable for informal communication.`,
+    concise: `Make the text shorter and more concise in ${langName} while keeping the key meaning.`,
+    elaborate: `Expand and elaborate on the text in ${langName} with more detail and nuance.`
+  };
+
+  const systemPrompt = `You are a professional ${langName} writing assistant. ${styleInstructions[style] || styleInstructions.rephrase}
+
+Return a JSON response:
+{
+  "rephrased": "the rephrased text",
+  "changes": "brief description of what changed, in ${langName}"
+}
+
+Respond ONLY with valid JSON, no markdown, no backticks.`;
+
+  try {
+    const raw = await callClaude(systemPrompt, text);
+    const parsed = parseJSON(raw);
+    if (!parsed) return res.status(500).json({ error: 'Failed to parse AI response' });
+
+    db.prepare('INSERT INTO api_usage (user_id, endpoint, language, chars_checked) VALUES (?, ?, ?, ?)').run(req.apiUser.id, 'rephrase', language || 'en', text.length);
+    db.prepare('UPDATE users SET api_calls_today = api_calls_today + 1 WHERE id = ?').run(req.apiUser.id);
+
+    res.json({ result: parsed });
+  } catch (e) {
+    console.error('[rephrase]', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/api/translate', apiKeyAuth, async (req, res) => {
+  const { text, language, targetLanguage } = req.body;
+  if (!text || text.trim().length < 2) return res.status(400).json({ error: 'Text required' });
+  if (text.length > 10000) return res.status(400).json({ error: 'Text too long. Maximum 10,000 characters.' });
+  if (!targetLanguage) return res.status(400).json({ error: 'Target language required' });
+  if (!AI_API_KEY) return res.status(500).json({ error: 'AI service not configured' });
+
+  const sourceLang = LANG_NAMES[language] || language || 'auto-detect';
+  const targetLang = LANG_NAMES[targetLanguage] || targetLanguage;
+
+  const systemPrompt = `You are a professional translator. Translate the text from ${sourceLang} to ${targetLang}. Preserve the original tone and meaning.
+
+Return a JSON response:
+{
+  "translated": "the translated text",
+  "sourceLang": "${sourceLang}",
+  "targetLang": "${targetLang}"
+}
+
+Respond ONLY with valid JSON, no markdown, no backticks.`;
+
+  try {
+    const raw = await callClaude(systemPrompt, text);
+    const parsed = parseJSON(raw);
+    if (!parsed) return res.status(500).json({ error: 'Failed to parse AI response' });
+
+    db.prepare('INSERT INTO api_usage (user_id, endpoint, language, chars_checked) VALUES (?, ?, ?, ?)').run(req.apiUser.id, 'translate', targetLanguage, text.length);
+    db.prepare('UPDATE users SET api_calls_today = api_calls_today + 1 WHERE id = ?').run(req.apiUser.id);
+
+    res.json({ result: parsed });
+  } catch (e) {
+    console.error('[translate]', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ─── Chatbot ───
-router.post('/api/chatbot', async (req, res) => {
+router.post('/api/chatbot', chatbotLimiter, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
   if (!AI_API_KEY) return res.json({ reply: 'Chatbot is not configured yet. Please contact support.' });
